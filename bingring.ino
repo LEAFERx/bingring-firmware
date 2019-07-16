@@ -2,13 +2,17 @@
 #include <Wire.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_ADXL345_U.h>
+#include <MAX30105.h>
+#include <heartRate.h>
+#include <spo2_algorithm.h>
 
 #define DEBUG
 
-#define GYRO_INT1_PIN 15
-#define GYRO_INT2_PIN 00
-#define MANUAL_BUTTON_PIN 00
-#define VIBERATOR_PIN 00
+#define GYRO_INT1_PIN 23
+#define GYRO_INT2_PIN 4
+#define GYRO_CS_PIN 15
+#define MANUAL_BUTTON_PIN 25
+#define VIBERATOR_PIN 26
 
 enum GYRO_INT_SOURCE {
   GYRO_INT_NONE = 0,
@@ -53,6 +57,17 @@ unsigned long detectFall(void);
 unsigned long lastManualButtonTriggered = 0;
 void detectManual(void);
 
+MAX30105 particleSensor;
+#define MAX_BRIGHTNESS 255
+uint32_t irBuffer[100]; //infrared LED sensor data
+uint32_t redBuffer[100];  //red LED sensor data
+
+int32_t bufferLength; //data length
+int32_t spo2; //SPO2 value
+int8_t validSPO2; //indicator to show if the SPO2 calculation is valid
+int32_t heartRate; //heart rate value
+int8_t validHeartRate; //indicator to show if the heart rate calculation is valid
+
 void initMAX30102(void);
 int getHeartBeat(void);
 int getSPO2(void);
@@ -62,13 +77,15 @@ void resetAlarm(void);
 
 bool shouldSendResetMessage = false;
 
-unsigned long asdasd = 0;
-
 void setup(void) {
   currentAlarmStatus = ALARM_NONE;
 
   pinMode(GYRO_INT1_PIN, INPUT);
   pinMode(GYRO_INT2_PIN, INPUT);
+  pinMode(GYRO_CS_PIN, OUTPUT);
+  pinMode(MANUAL_BUTTON_PIN, INPUT);
+  pinMode(VIBERATOR_PIN, OUTPUT);
+
   attachInterrupt(GYRO_INT2_PIN, resetAlarm, RISING);
 
   A9.begin(115200, SERIAL_8N1, 16, 17);
@@ -78,10 +95,8 @@ void setup(void) {
   delay(100);
 
   initA9();
-  //initGyro();
-  //initMAX30102();
-
-  asdasd = millis();
+  initGyro();
+  initMAX30102();
 }
 
 void loop(void) {
@@ -100,6 +115,7 @@ void loop(void) {
 
   if (shouldSendResetMessage) {
     shouldSendResetMessage = false;
+    debug("double tap. reset");
     A9.println("at+mqttpub=\"alarm_status\",\"0\",0,0,1");
   }
 
@@ -115,17 +131,12 @@ void loop(void) {
       currentAlarmStatus = ALARM_NONE;
     }
   }
-  /*
-  if (millis() - asdasd > 5000) {
-    debug("int1status");
-    debug(String(digitalRead(GYRO_INT1_PIN)));
-    asdasd = millis();
-  }
   if (!currentAlarmStatus) {
     // no alarm, detecting
     lastReportTime = 0;
     // detect manual
-    if (digitalRead(MANUAL_BUTTON_PIN) == HIGH) {
+    if (analogRead(MANUAL_BUTTON_PIN) < 1400) {
+      debug("pressed");
       if (!lastManualButtonTriggered) {
         lastManualButtonTriggered = millis();
       } else if (millis() - lastManualButtonTriggered > 5000) {
@@ -138,9 +149,7 @@ void loop(void) {
     uint8_t gyroInt1Status =  digitalRead(GYRO_INT1_PIN);
     if (gyroInt1Status == HIGH) {
       // int triggered
-      debug("inttype");
       uint8_t intType = getGyroIntSource();
-      debug(String(intType));
       if (intType == GYRO_INT_FREEFALL) {
         lastFallDetectTime = detectFall();
       }
@@ -168,11 +177,29 @@ void loop(void) {
       }
     }
 
+    //dumping the first 25 sets of samples in the memory and shift the last 75 sets of samples to the top
+    for (byte i = 25; i < 100; i++) {
+      redBuffer[i - 25] = redBuffer[i];
+      irBuffer[i - 25] = irBuffer[i];
+    }
+
+    //take 25 sets of samples before calculating the heart rate.
+    for (byte i = 75; i < 100; i++) {
+      while (particleSensor.available() == false) //do we have new data?
+        particleSensor.check(); //Check the sensor for new data
+      redBuffer[i] = particleSensor.getRed();
+      irBuffer[i] = particleSensor.getIR();
+      particleSensor.nextSample(); //We're finished with this sample so move to next sample
+    }
+
+    //After gathering 25 new samples recalculate HR and SP02
+    maxim_heart_rate_and_oxygen_saturation(irBuffer, bufferLength, redBuffer, &spo2, &validSPO2, &heartRate, &validHeartRate);
+
     if (!lastReportTime || millis() - lastReportTime > 1000 || millis() - lastReportTime < 0) {
       report();
+      lastReportTime = millis();
     }
   }
-  */
 }
 
 void debug(String msg) {
@@ -248,12 +275,13 @@ void initA9() {
 }
 
 void connectMqtt(void) {
+  String msg;
   while (1) {
     A9.println("at+mqttconn=\"bingring.leaferx.ink\",1883,\"device\",300,0");
     while (!A9.available());
     msg = A9.readString();
     if (msg.indexOf("OK") == -1) {
-      if (msg.indexOf("58" != -1)) {
+      if (msg.indexOf("58") != -1) {
         A9.println();
       }
       debug("cannot connect mqtt broker. retry after 5s");
@@ -267,6 +295,9 @@ void connectMqtt(void) {
 }
 
 void initGyro(void) {
+  digitalWrite(GYRO_CS_PIN, HIGH);
+  delay(200);
+
   if(!gyro.begin()) {
     Serial.println("Failed to init ADXL345");
     while(1);
@@ -292,8 +323,6 @@ void initGyro(void) {
 
 uint8_t getGyroIntSource(void) {
   uint8_t source = gyro.readRegister(ADXL345_REG_INT_SOURCE);
-  debug("source");
-  debug(String(source));
   if (source & 0x04) return GYRO_INT_FREEFALL;
   if (source & 0x08) return GYRO_INT_INACT;
   if (source & 0x10) return GYRO_INT_ACT;
@@ -326,7 +355,7 @@ unsigned long detectFall(void) {
   timer = millis();
   while (digitalRead(GYRO_INT1_PIN) == LOW || getGyroIntSource() != GYRO_INT_ACT) {
     if (millis() - timer > 200) {
-      // time out
+      debug("time out");
       return 0;
     } 
   }
@@ -335,7 +364,7 @@ unsigned long detectFall(void) {
   timer = millis();
   while (digitalRead(GYRO_INT1_PIN) == LOW || getGyroIntSource() != GYRO_INT_INACT) {
     if (millis() - timer > 3500) {
-      // time out
+      debug("time out");
       return 0;
     } 
   }
@@ -366,19 +395,22 @@ void viberate(int lastTime) {
 }
 
 void detectManual(void) {
+  debug("begin manual detect");
   viberate(100);
 
   unsigned long timer = millis();
-  while (digitalRead(MANUAL_BUTTON_PIN) == HIGH) {
-    if (millis() - timer > 1000) {
+  while (analogRead(MANUAL_BUTTON_PIN) < 1400) {
+    if (millis() - timer > 1500) {
       viberate(100);
+      lastManualButtonTriggered = 0;
       return;
     }
   }
   delay(100);
-  while (digitalRead(MANUAL_BUTTON_PIN) == LOW) {
-    if (millis() - timer > 1000) {
+  while (analogRead(MANUAL_BUTTON_PIN) > 3000) {
+    if (millis() - timer > 1500) {
       viberate(100);
+      lastManualButtonTriggered = 0;
       return;
     }
   }
@@ -387,15 +419,41 @@ void detectManual(void) {
 }
 
 void initMAX30102(void) {
-  return;
+  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) { //Use default I2C port, 400kHz speed
+    Serial.println("MAX30105 was not found. Please check wiring/power. ");
+    while (1);
+  }
+  byte ledBrightness = 60; //Options: 0=Off to 255=50mA
+  byte sampleAverage = 4; //Options: 1, 2, 4, 8, 16, 32
+  byte ledMode = 2; //Options: 1 = Red only, 2 = Red + IR, 3 = Red + IR + Green
+  byte sampleRate = 100; //Options: 50, 100, 200, 400, 800, 1000, 1600, 3200
+  int pulseWidth = 411; //Options: 69, 118, 215, 411
+  int adcRange = 4096; //Options: 2048, 4096, 8192, 16384
+
+  particleSensor.setup(ledBrightness, sampleAverage, ledMode, sampleRate, pulseWidth, adcRange); //Configure sensor with these settings
+
+  bufferLength = 100; //buffer length of 100 stores 4 seconds of samples running at 25sps
+
+  //read the first 100 samples, and determine the signal range
+  for (byte i = 0 ; i < bufferLength ; i++) {
+    while (particleSensor.available() == false) //do we have new data?
+      particleSensor.check(); //Check the sensor for new data
+
+    redBuffer[i] = particleSensor.getRed();
+    irBuffer[i] = particleSensor.getIR();
+    particleSensor.nextSample(); //We're finished with this sample so move to next sample
+  }
+
+  //calculate heart rate and SpO2 after first 100 samples (first 4 seconds of samples)
+  maxim_heart_rate_and_oxygen_saturation(irBuffer, bufferLength, redBuffer, &spo2, &validSPO2, &heartRate, &validHeartRate);
 }
 
 int getHeartBeat(void) {
-  return 0;
+  return heartRate;
 }
 
 int getSPO2(void) {
-  return 0;
+  return spo2;
 }
 
 void report(void) {

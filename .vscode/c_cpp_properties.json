@@ -3,6 +3,7 @@
         {
             "name": "Win32",
             "includePath": [
+                "C:\\Users\\LEAFERx\\Documents\\Arduino\\libraries\\SparkFun_MAX3010x_Pulse_and_Proximity_Sensor_Library\\src",
                 "C:\\Users\\LEAFERx\\Documents\\Arduino\\libraries\\Adafruit_Unified_Sensor",
                 "C:\\Users\\LEAFERx\\Documents\\Arduino\\libraries\\Adafruit_ADXL345",
                 "C:\\Users\\LEAFERx\\Documents\\ArduinoData\\packages\\esp32\\tools\\**",
