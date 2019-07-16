@@ -129,6 +129,7 @@ void loop(void) {
     if (msg.indexOf("+MQTTPUBLISH") != -1) {
       debug("reset alarm packet recieved");
       currentAlarmStatus = ALARM_NONE;
+      A9.println("at+mqttpub=\"alarm_status\",\"0\",0,0,1");
     }
   }
   if (!currentAlarmStatus) {
